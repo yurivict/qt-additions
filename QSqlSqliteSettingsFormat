@@ -1,0 +1,281 @@
+#include <QSettings>
+#include <QString>
+#include <QStringList>
+#include <QVariant>
+#include <QByteArray>
+#include <QIODevice>
+#include <QDataStream>
+#include <QFile>
+#include <QMap>
+#include <QMapIterator>
+#include <QSqlDatabase>
+#include <QSqlQuery>
+#include <QSqlError>
+#include <QDebug>
+#ifndef QT_NO_GEOM_VARIANT
+#include <QRect>
+#include <QSize>
+#include <QPoint>
+#endif // !QT_NO_GEOM_VARIANT
+
+class QSqlSqliteSettingsFormat {
+private: // internals
+  static QSqlDatabase& getDb() {
+    static QSqlDatabase db;
+    if (db.connectionName().isEmpty())
+      db = QSqlDatabase::addDatabase("QSQLITE", "settings");
+    return db;
+  }
+  static QSqlDatabase& openDb(const QString &dbPath) {
+    QSqlDatabase &db = getDb();
+    db.setDatabaseName(dbPath);
+    if (!db.open())
+      dbError("open", db.lastError());
+    if (db.isOpen() && !(haveSchema(db) || createSchema(db)))
+      db.close();
+    return db;
+  }
+  static bool createSchema(QSqlDatabase &db) {
+    QSqlQuery query(db);
+    if (!query.exec(
+      "create table if not exists key_value "
+        "(key varchar(1024) primary key,"
+        " val_type integer not null,"
+        " val_data text null)"))
+      return dbError("create table", db.lastError());
+    if (!query.exec(
+      "create table if not exists qt_version "
+        "(version varchar(32) primary key)"))
+      return dbError("create table", db.lastError());
+    if (!query.exec(QString("insert or ignore into qt_version (version) values ('%1')").arg(QT_VERSION_STR)))
+      return dbError("insert(qt_version)", db.lastError());
+    return true;
+  }
+  static bool haveSchema(QSqlDatabase &db) {
+    QSqlQuery qry(db);
+    if (!qry.exec("select count(*) from sqlite_master where type='table' and name='key_value'"))
+      dbError("select(count)", db.lastError());
+    return qry.next() && qry.value(0).toInt() > 0;
+  }
+  template<typename T>
+  static QByteArray serialize(const T& x) {
+    QByteArray ba;
+    QDataStream s(&ba, QIODevice::WriteOnly);
+    s << x;
+    return ba;
+  }
+  template<typename T>
+  static T unserialize(const QByteArray &ba) {
+    QDataStream s(ba);
+    T res;
+    s >> res;
+    return res;
+  }
+  static QString byteArrayToString(const QByteArray& ba) {
+    return QString(ba.toHex());
+  }
+  static QByteArray stringToByteArray(const QString& str) {
+    return QByteArray::fromHex(str.toLatin1());
+  }
+  static bool writeMap(QSqlDatabase &db, const QSettings::SettingsMap &map) {
+    bool ok = true;
+    QMap<QString, QString> recsExist;
+    {
+        QSqlQuery qrySelect(db);
+        if (!qrySelect.exec("select key, val_data from key_value"))
+            ok = dbError("select(key)", db.lastError());
+        while (qrySelect.next())
+            recsExist[qrySelect.value(0).toString()] = qrySelect.value(1).toString();
+    }
+    if (!ok)
+        return false;
+    QSqlQuery qryInsert(db);
+    QSqlQuery qryUpdate(db);
+    qryInsert.prepare("insert into key_value(key, val_type, val_data) values (:key, :val_type, :val_data)");
+    qryUpdate.prepare("update key_value set val_type = :val_type, val_data = :val_data where key = :key");
+    QMapIterator<QString, QVariant> i(map);
+    while (i.hasNext()) {
+      i.next();
+      QSqlQuery &qry = recsExist.contains(i.key()) ? qryUpdate : qryInsert;
+      qry.bindValue(":key", i.key());
+      QVariant v = i.value();
+      qry.bindValue(":val_type", int(v.type()));
+      QVariant valData;
+      switch (v.type()) {
+        case QVariant::Invalid: {
+          valData = QVariant(QVariant::Invalid);
+          break;
+        }
+        case QVariant::ByteArray: {
+          valData = byteArrayToString(v.toByteArray());
+          break;
+        }
+        case QVariant::String:
+        case QVariant::LongLong:
+        case QVariant::ULongLong:
+        case QVariant::Int:
+        case QVariant::UInt:
+        case QVariant::Bool:
+        case QVariant::Double: {
+          valData = v.toString();
+          break;
+        }
+#ifndef QT_NO_GEOM_VARIANT
+        case QVariant::Rect: {
+          valData = byteArrayToString(serialize<QRect>(qvariant_cast<QRect>(v)));
+          break;
+        }
+        case QVariant::Size: {
+          valData = byteArrayToString(serialize<QSize>(qvariant_cast<QSize>(v)));
+          break;
+        }
+        case QVariant::Point: {
+          valData = byteArrayToString(serialize<QPoint>(qvariant_cast<QPoint>(v)));
+          break;
+        }
+#endif // !QT_NO_GEOM_VARIANT
+        default: {
+#ifndef QT_NO_DATASTREAM
+          QByteArray a;
+          QDataStream s(&a, QIODevice::WriteOnly);
+          s << v;
+          valData = byteArrayToString(a);
+#else
+          Q_ASSERT(!"QSqlSqliteSettingsFormat: Cannot save custom types without QDataStream support");
+          continue;
+#endif
+        }
+      }
+
+      if (&qry == &qryUpdate && valData.toString() == recsExist[i.key()]) {
+          recsExist.erase(recsExist.find(i.key()));
+          continue;
+      }
+
+      qry.bindValue(":val_data", valData);
+        
+      if (!qry.exec())
+          ok = dbError(QString("%1 (key=%2)").arg(&qry==&qryInsert ? "insert" : "update").arg(i.key()), db.lastError());
+
+      recsExist.erase(recsExist.find(i.key()));
+    }
+
+    if (!recsExist.empty()) {
+        QSqlQuery qryDelete(db);
+        qryDelete.prepare("delete from key_value where key = :key");
+        QMapIterator<QString,QString> i(recsExist);
+        while (i.hasNext()) {
+            qryDelete.bindValue(":key", i.next().key());
+            if (!qryDelete.exec())
+                ok = dbError("delete", db.lastError());
+        }
+    }
+    return ok;
+  }
+  static bool readMap(QSqlDatabase &db, QSettings::SettingsMap &map) {
+    bool ok = true;
+    QSqlQuery qrySelect(db);
+    if (!qrySelect.exec("select key, val_type, val_data from key_value"))
+      ok = dbError("select", db.lastError());
+    while (ok && qrySelect.next()) {
+      QString key = qrySelect.value(0).toString();
+      QVariant::Type valType = (QVariant::Type)qrySelect.value(1).toInt();
+      QString valString = qrySelect.value(2).toString();
+      switch (valType) {
+        case QVariant::Invalid: {
+          map[key] = QVariant();
+          break;
+        }
+        case QVariant::ByteArray: {
+          map[key] = stringToByteArray(valString);
+          break;
+        }
+        case QVariant::String: {
+          map[key] = QVariant(valString);
+          break;
+        }
+        case QVariant::LongLong: {
+          map[key] = QVariant(valString.toLongLong());
+          break;
+        }
+        case QVariant::ULongLong: {
+          map[key] = QVariant(valString.toULongLong());
+          break;
+        }
+        case QVariant::Int: {
+          map[key] = QVariant(valString.toInt());
+          break;
+        }
+        case QVariant::UInt: {
+          map[key] = QVariant(valString.toUInt());
+          break;
+        }
+        case QVariant::Bool: {
+          map[key] = QVariant(valString=="true");
+          break;
+        }
+        case QVariant::Double: {
+          map[key] = QVariant(valString.toDouble());
+          break;
+        }
+#ifndef QT_NO_GEOM_VARIANT
+        case QVariant::Rect: {
+          map[key] = QVariant(unserialize<QRect>(stringToByteArray(valString)));
+          break;
+        }
+        case QVariant::Size: {
+          map[key] = QVariant(unserialize<QSize>(stringToByteArray(valString)));
+          break;
+        }
+        case QVariant::Point: {
+          map[key] = QVariant(unserialize<QPoint>(stringToByteArray(valString)));
+          break;
+        }
+#endif // !QT_NO_GEOM_VARIANT
+        default: {
+#ifndef QT_NO_DATASTREAM
+          QByteArray ba = stringToByteArray(valString);
+          QDataStream stream(&ba, QIODevice::ReadOnly);
+          QVariant result;
+          stream >> result;
+          map[key] = result;
+#else
+          Q_ASSERT(!"QSqlSqliteSettingsFormat: Cannot save custom types without QDataStream support");
+#endif
+        }
+      }
+    }
+    return ok;
+  }
+  static QString deviceToFileName(QIODevice &device) {
+    return ((QFile&)device).fileName();
+  }
+  static QString deviceToDbFile(QIODevice &device) {
+    QStringList spl = deviceToFileName(device).split(".");
+    spl[spl.size()-1] = "sqlite";
+    return spl.join(".");
+  }
+  static bool dbError(const QString &op, const QSqlError &msg) {
+    qCritical() << "QSqlSqliteSettingsFormat: database error occurred during '" << op << "': " << msg;
+    return false;
+  }
+public: // format interface for QSettings::registerFormat
+  static bool readFile(QIODevice &device, QSettings::SettingsMap &map) {
+    QSqlDatabase &db = openDb(deviceToDbFile(device));
+    bool ok = db.isOpen() && readMap(db, map);
+    if (db.isOpen())
+        db.close();
+    return ok;
+  }
+  static bool writeFile(QIODevice &device, const QSettings::SettingsMap &map) {
+    QSqlDatabase& db = openDb(deviceToDbFile(device));
+    bool ok = db.isOpen() && writeMap(db, map);
+    if (db.isOpen())
+        db.close();
+    // only the placeholder is written into the original config file
+    device.write("placeholder");
+    return ok;
+  }
+}; // QSqlSqliteSettingsFormat
+
+/* vim: set filetype=cpp: */
