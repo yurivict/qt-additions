@@ -153,9 +153,9 @@ private: // internals
       }
 
       qry.bindValue(":val_data", valData);
-        
+
       if (!qry.exec())
-          ok = dbError(QString("%1 (key=%2)").arg(&qry==&qryInsert ? "insert" : "update").arg(i.key()), db.lastError());
+          ok &= dbError(QString("%1 (key=%2)").arg(&qry==&qryInsert ? "insert" : "update").arg(i.key()), db.lastError());
 
       recsExist.erase(recsExist.find(i.key()));
     }
@@ -167,7 +167,7 @@ private: // internals
         while (i.hasNext()) {
             qryDelete.bindValue(":key", i.next().key());
             if (!qryDelete.exec())
-                ok = dbError("delete", db.lastError());
+                ok &= dbError("delete", db.lastError());
         }
     }
     return ok;
@@ -255,8 +255,8 @@ private: // internals
     spl[spl.size()-1] = "sqlite";
     return spl.join(".");
   }
-  static bool dbError(const QString &op, const QSqlError &msg) {
-    qCritical() << "QSqlSqliteSettingsFormat: database error occurred during '" << op << "': " << msg;
+  static bool dbError(const QString &op, const QSqlError &err) {
+    qCritical() << QString("QSqlSqliteSettingsFormat: database error occurred during '%1': %2").arg(op).arg(err.text());
     return false;
   }
 public: // format interface for QSettings::registerFormat
